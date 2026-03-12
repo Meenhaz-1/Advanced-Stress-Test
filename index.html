@@ -1,1 +1,309 @@
-inde
+<!-- index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mobile Crash Harness - Config</title>
+  <style>
+    body { margin:0; font-family: Arial, sans-serif; background:#0f0f10; color:#fff; }
+    .wrap { padding:14px; max-width:760px; margin:0 auto; }
+    h1 { font-size:18px; margin:0 0 12px; }
+    .card { background:#17171a; border-radius:12px; padding:12px; margin:12px 0; }
+    label { display:block; font-size:12px; opacity:.9; margin:10px 0 6px; }
+    input { width:100%; padding:10px; border-radius:10px; border:1px solid #2a2a2f; background:#0f0f10; color:#fff; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+    button {
+      background:#2b62ff; color:#fff; border:none; border-radius:10px;
+      padding:10px 12px; font-weight:600; cursor:pointer;
+    }
+    button.secondary { background:#2a2a2f; }
+    pre { white-space:pre-wrap; word-break:break-word; font-size:12px; opacity:.95; }
+    .small { font-size:12px; opacity:.85; line-height:1.4; }
+    .list { display:flex; flex-direction:column; gap:8px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#2a2a2f; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Mobile Crash Harness - Config</h1>
+
+    <div class="card small">
+      Mobile-only stress harness to test whether infinite heavy images can trigger an unexpected tab reload on low-RAM devices.
+      Landing page does not stress the device - it only configures runs and shows history.
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>batch (images per tick)</label>
+          <input id="batch" type="number" inputmode="numeric" value="15" min="1" />
+        </div>
+        <div>
+          <label>addIntervalMs (tick interval)</label>
+          <input id="addIntervalMs" type="number" inputmode="numeric" value="400" min="50" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>scrollSpeedPxPerFrame</label>
+          <input id="scrollSpeed" type="number" inputmode="numeric" value="60" min="0" />
+        </div>
+        <div>
+          <label>maxCrashLogsToKeep</label>
+          <input id="maxCrashes" type="number" inputmode="numeric" value="10" min="1" max="50" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>videoCadence (0 = off, else every N images)</label>
+          <input id="videoCadence" type="number" inputmode="numeric" value="0" min="0" />
+        </div>
+        <div>
+          <label>canvasCadence (0 = off, else every N images)</label>
+          <input id="canvasCadence" type="number" inputmode="numeric" value="0" min="0" />
+        </div>
+      </div>
+
+      <label>seed (optional, for reproducibility)</label>
+      <input id="seed" type="text" placeholder="e.g. 12345 or 'runA'" />
+
+      <div class="btns">
+        <button id="start">Start Run</button>
+        <button class="secondary" id="export">Export All Logs (JSON)</button>
+        <button class="secondary" id="clear">Clear Logs</button>
+      </div>
+
+      <div class="small" style="margin-top:10px;">
+        If a run page reloads unexpectedly, it will record a crash entry using the last saved checkpoint.
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+        <div>
+          <div style="font-weight:700;">Device Session</div>
+          <div class="small">Persistent per device unless cleared.</div>
+        </div>
+        <span class="pill" id="sessionIdPill">sessionId: ...</span>
+      </div>
+      <pre id="sessionMeta"></pre>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:700; margin-bottom:8px;">Recent Crashes (latest first)</div>
+      <div id="crashList" class="list small"></div>
+      <div id="noCrashes" class="small" style="opacity:.7;">No crashes recorded yet.</div>
+    </div>
+  </div>
+
+  <script>
+    // ---------- Tiny IndexedDB helper ----------
+    const DB_NAME = "mobile_crash_harness_db";
+    const DB_VER = 1;
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VER);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains("sessions")) db.createObjectStore("sessions", { keyPath: "sessionId" });
+          if (!db.objectStoreNames.contains("runs")) db.createObjectStore("runs", { keyPath: "runId" });
+          if (!db.objectStoreNames.contains("checkpoints")) {
+            const s = db.createObjectStore("checkpoints", { keyPath: "id" });
+            s.createIndex("runId", "runId", { unique: false });
+            s.createIndex("t", "t", { unique: false });
+          }
+          if (!db.objectStoreNames.contains("crashes")) {
+            const s = db.createObjectStore("crashes", { keyPath: "id" });
+            s.createIndex("sessionId", "sessionId", { unique: false });
+            s.createIndex("runId", "runId", { unique: false });
+            s.createIndex("crashAt", "crashAt", { unique: false });
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function tx(db, store, mode="readonly") {
+      return db.transaction(store, mode).objectStore(store);
+    }
+
+    function id() {
+      return (crypto?.randomUUID?.() || (Date.now() + "-" + Math.random().toString(16).slice(2)));
+    }
+
+    function getOrCreateSessionId() {
+      const key = "mch_sessionId";
+      let sid = localStorage.getItem(key);
+      if (!sid) {
+        sid = "sess_" + id();
+        localStorage.setItem(key, sid);
+      }
+      return sid;
+    }
+
+    function deviceInfo() {
+      return {
+        userAgent: navigator.userAgent || null,
+        platform: navigator.platform || null,
+        language: navigator.language || null,
+        hardwareConcurrency: navigator.hardwareConcurrency || null,
+        deviceMemoryGB: navigator.deviceMemory || null
+      };
+    }
+
+    async function ensureSession(db, sessionId) {
+      const store = tx(db, "sessions");
+      const existing = await new Promise((res, rej) => {
+        const r = store.get(sessionId);
+        r.onsuccess = () => res(r.result || null);
+        r.onerror = () => rej(r.error);
+      });
+      if (existing) return existing;
+
+      const session = { sessionId, createdAt: Date.now(), device: deviceInfo() };
+      await new Promise((res, rej) => {
+        const w = tx(db, "sessions", "readwrite").put(session);
+        w.onsuccess = () => res();
+        w.onerror = () => rej(w.error);
+      });
+      return session;
+    }
+
+    async function listCrashes(db, sessionId, limit=10) {
+      // Use index scan by crashAt requires manual sort since we stored only indexes.
+      const crashes = await new Promise((res, rej) => {
+        const store = tx(db, "crashes");
+        const idx = store.index("sessionId");
+        const req = idx.getAll(sessionId);
+        req.onsuccess = () => res(req.result || []);
+        req.onerror = () => rej(req.error);
+      });
+      crashes.sort((a,b) => b.crashAt - a.crashAt);
+      return crashes.slice(0, limit);
+    }
+
+    async function exportAll(db, sessionId) {
+      const session = await new Promise((res, rej) => {
+        const r = tx(db, "sessions").get(sessionId);
+        r.onsuccess = () => res(r.result || null);
+        r.onerror = () => rej(r.error);
+      });
+
+      const runs = await new Promise((res, rej) => {
+        const r = tx(db, "runs").getAll();
+        r.onsuccess = () => res(r.result || []);
+        r.onerror = () => rej(r.error);
+      });
+
+      const checkpoints = await new Promise((res, rej) => {
+        const r = tx(db, "checkpoints").getAll();
+        r.onsuccess = () => res(r.result || []);
+        r.onerror = () => rej(r.error);
+      });
+
+      const crashes = await new Promise((res, rej) => {
+        const r = tx(db, "crashes").getAll();
+        r.onsuccess = () => res(r.result || []);
+        r.onerror = () => rej(r.error);
+      });
+
+      const payload = {
+        exportedAt: Date.now(),
+        sessionId,
+        session,
+        runs: runs.filter(r => r.sessionId === sessionId),
+        checkpoints: checkpoints.filter(c => c.sessionId === sessionId),
+        crashes: crashes.filter(c => c.sessionId === sessionId),
+      };
+
+      downloadJSON(payload, `crash_harness_${sessionId}_${new Date().toISOString().replaceAll(":","-")}.json`);
+    }
+
+    function downloadJSON(obj, filename) {
+      const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+
+    async function clearAll(db) {
+      const stores = ["sessions", "runs", "checkpoints", "crashes"];
+      for (const s of stores) {
+        await new Promise((res, rej) => {
+          const t = db.transaction(s, "readwrite");
+          t.objectStore(s).clear();
+          t.oncomplete = () => res();
+          t.onerror = () => rej(t.error);
+        });
+      }
+      localStorage.removeItem("mch_sessionId");
+      localStorage.removeItem("mch_activeRun");
+    }
+
+    // ---------- UI ----------
+    (async function init() {
+      const db = await openDB();
+      const sessionId = getOrCreateSessionId();
+      document.getElementById("sessionIdPill").textContent = `sessionId: ${sessionId}`;
+
+      const session = await ensureSession(db, sessionId);
+      document.getElementById("sessionMeta").textContent = JSON.stringify(session, null, 2);
+
+      async function renderCrashes() {
+        const crashes = await listCrashes(db, sessionId, 10);
+        const list = document.getElementById("crashList");
+        list.innerHTML = "";
+        document.getElementById("noCrashes").style.display = crashes.length ? "none" : "block";
+
+        crashes.forEach(c => {
+          const div = document.createElement("div");
+          const dt = new Date(c.crashAt).toLocaleString();
+          const img = c.priorCheckpoint?.imageCount ?? "?";
+          const fps = c.priorCheckpoint?.fps ?? null;
+          const mem = c.priorCheckpoint?.jsHeapUsedBytes ?? null;
+          div.textContent =
+            `${dt} | runId=${c.runId} | images=${img} | fps=${fps ? fps.toFixed(1) : "?"} | heap=${mem ? Math.round(mem/1024/1024)+"MB" : "n/a"}`;
+          list.appendChild(div);
+        });
+      }
+      await renderCrashes();
+
+      document.getElementById("start").onclick = () => {
+        const params = {
+          sessionId,
+          runId: "run_" + id(),
+          batch: Number(document.getElementById("batch").value) || 15,
+          addIntervalMs: Number(document.getElementById("addIntervalMs").value) || 400,
+          scrollSpeed: Number(document.getElementById("scrollSpeed").value) || 60,
+          videoCadence: Math.max(0, Number(document.getElementById("videoCadence").value) || 0),
+          canvasCadence: Math.max(0, Number(document.getElementById("canvasCadence").value) || 0),
+          maxCrashes: Math.max(1, Number(document.getElementById("maxCrashes").value) || 10),
+          seed: (document.getElementById("seed").value || "").trim()
+        };
+        const qs = new URLSearchParams(params).toString();
+        location.href = `run.html?${qs}`;
+      };
+
+      document.getElementById("export").onclick = async () => {
+        await exportAll(db, sessionId);
+      };
+
+      document.getElementById("clear").onclick = async () => {
+        await clearAll(db);
+        location.reload();
+      };
+    })();
+  </script>
+</body>
+</html>
