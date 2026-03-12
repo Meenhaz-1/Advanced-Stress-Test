@@ -1,0 +1,643 @@
+<!-- run.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mobile Crash Harness - Run</title>
+
+  <style>
+    body { margin:0; background:#111; color:white; font-family:Arial, sans-serif; }
+    .container { padding:12px; display:flex; flex-direction:column; gap:16px; }
+    .item { position:relative; aspect-ratio:3/4; background:#333; border-radius:10px; overflow:hidden; }
+    .item span {
+      position:absolute; top:6px; left:6px;
+      background:rgba(0,0,0,.85); padding:3px 6px; font-size:11px; border-radius:6px;
+      z-index:3;
+    }
+    img,canvas,video { width:100%; height:100%; object-fit:cover; display:block; }
+    #hud {
+      position:fixed;
+      top:10px; left:10px; right:10px;
+      background:rgba(0,0,0,0.92);
+      padding:12px;
+      font-size:12px;
+      border-radius:12px;
+      z-index:99999;
+      box-shadow: 0 6px 20px rgba(0,0,0,.35);
+    }
+    #hud .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; }
+    #hud button {
+      border:none; border-radius:10px; padding:8px 10px; font-weight:700; cursor:pointer;
+      background:#2b62ff; color:#fff;
+    }
+    #hud button.secondary { background:#2a2a2f; }
+    #hud .kv { line-height:1.4; }
+    #hud .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+  <div class="container" id="container"></div>
+
+  <script>
+    // ============================================================
+    // Mobile Crash Harness Run Page
+    //
+    // What this does (high-level):
+    // - Reads parameters from querystring (batch, scrollSpeed, cadences, seed, etc.)
+    // - Appends heavy images forever (900x1200)
+    // - Optional: inject video/canvas at cadence
+    // - Auto-scrolls continuously
+    // - Samples performance signals every few seconds ("checkpoints")
+    // - Persists checkpoints and crash logs to IndexedDB
+    // - On unexpected reload, logs crash using last checkpoint
+    // - Allows exporting JSON of current session data
+    // ============================================================
+
+    // ---------- Params ----------
+    const p = new URLSearchParams(location.search);
+
+    const sessionId = p.get("sessionId") || localStorage.getItem("mch_sessionId") || "sess_unknown";
+    const runId = p.get("runId") || ("run_" + (crypto?.randomUUID?.() || Date.now()));
+    const batch = Number(p.get("batch")) || 15;
+    const addIntervalMs = Number(p.get("addIntervalMs")) || 400;
+    const scrollSpeed = Number(p.get("scrollSpeed")) || 60;
+    const videoCadence = Math.max(0, Number(p.get("videoCadence")) || 0);
+    const canvasCadence = Math.max(0, Number(p.get("canvasCadence")) || 0);
+    const maxCrashes = Math.max(1, Number(p.get("maxCrashes")) || 10);
+    const seed = (p.get("seed") || "").trim();
+
+    // Heavy fixed asset size (as requested)
+    const W = 900;
+    const H = 1200;
+
+    // ---------- State ----------
+    const container = document.getElementById("container");
+    const hud = document.getElementById("hud");
+
+    let imageCount = 0;
+    let videoCount = 0;
+    let canvasCount = 0;
+
+    let stopped = false;
+    let runStartedAt = Date.now();
+
+    // FPS estimate
+    let lastFrameT = performance.now();
+    let fps = 60;
+    let fpsSmoothed = 60;
+
+    // Long tasks (if supported)
+    let longTasksCount = 0;
+    let longTasksTotalMs = 0;
+    let longTasksSupported = false;
+
+    // Last saved checkpoint (in memory)
+    let lastCheckpoint = null;
+
+    // ---------- Deterministic PRNG (optional seed) ----------
+    function xfnv1a(str) {
+      // string -> 32-bit seed
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return h >>> 0;
+    }
+    function mulberry32(a) {
+      return function() {
+        let t = a += 0x6D2B79F5;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    const rng = seed ? mulberry32(xfnv1a(seed)) : null;
+
+    // ---------- IndexedDB ----------
+    const DB_NAME = "mobile_crash_harness_db";
+    const DB_VER = 1;
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VER);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains("sessions")) db.createObjectStore("sessions", { keyPath: "sessionId" });
+          if (!db.objectStoreNames.contains("runs")) db.createObjectStore("runs", { keyPath: "runId" });
+          if (!db.objectStoreNames.contains("checkpoints")) {
+            const s = db.createObjectStore("checkpoints", { keyPath: "id" });
+            s.createIndex("runId", "runId", { unique: false });
+            s.createIndex("t", "t", { unique: false });
+          }
+          if (!db.objectStoreNames.contains("crashes")) {
+            const s = db.createObjectStore("crashes", { keyPath: "id" });
+            s.createIndex("sessionId", "sessionId", { unique: false });
+            s.createIndex("runId", "runId", { unique: false });
+            s.createIndex("crashAt", "crashAt", { unique: false });
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function tx(db, store, mode="readonly") {
+      return db.transaction(store, mode).objectStore(store);
+    }
+
+    function uid() {
+      return (crypto?.randomUUID?.() || (Date.now() + "-" + Math.random().toString(16).slice(2)));
+    }
+
+    function deviceInfo() {
+      return {
+        userAgent: navigator.userAgent || null,
+        platform: navigator.platform || null,
+        language: navigator.language || null,
+        hardwareConcurrency: navigator.hardwareConcurrency || null,
+        deviceMemoryGB: navigator.deviceMemory || null
+      };
+    }
+
+    async function ensureSession(db) {
+      const store = tx(db, "sessions");
+      const existing = await new Promise((res, rej) => {
+        const r = store.get(sessionId);
+        r.onsuccess = () => res(r.result || null);
+        r.onerror = () => rej(r.error);
+      });
+      if (existing) return existing;
+
+      const session = { sessionId, createdAt: Date.now(), device: deviceInfo() };
+      await new Promise((res, rej) => {
+        const w = tx(db, "sessions", "readwrite").put(session);
+        w.onsuccess = () => res();
+        w.onerror = () => rej(w.error);
+      });
+      return session;
+    }
+
+    async function saveRun(db, isActive) {
+      const run = {
+        runId,
+        sessionId,
+        startedAt: runStartedAt,
+        params: { batch, addIntervalMs, scrollSpeed, videoCadence, canvasCadence, maxCrashes, seed: seed || null },
+        isActive: !!isActive,
+        lastUpdatedAt: Date.now()
+      };
+      await new Promise((res, rej) => {
+        const w = tx(db, "runs", "readwrite").put(run);
+        w.onsuccess = () => res();
+        w.onerror = () => rej(w.error);
+      });
+    }
+
+    async function writeCheckpoint(db, cp) {
+      // Cap checkpoint count per run to avoid infinite storage growth (hard cap)
+      // This does NOT cap images. It caps stored telemetry.
+      const MAX_CP = 1000;
+
+      const existing = await new Promise((res, rej) => {
+        const idx = tx(db, "checkpoints").index("runId");
+        const r = idx.getAll(runId);
+        r.onsuccess = () => res(r.result || []);
+        r.onerror = () => rej(r.error);
+      });
+
+      if (existing.length >= MAX_CP) {
+        // delete oldest checkpoints (batch)
+        existing.sort((a,b) => a.t - b.t);
+        const toDelete = existing.slice(0, Math.max(1, existing.length - MAX_CP + 1));
+        await new Promise((res, rej) => {
+          const t = db.transaction("checkpoints", "readwrite");
+          const store = t.objectStore("checkpoints");
+          toDelete.forEach(x => store.delete(x.id));
+          t.oncomplete = () => res();
+          t.onerror = () => rej(t.error);
+        });
+      }
+
+      await new Promise((res, rej) => {
+        const w = tx(db, "checkpoints", "readwrite").put(cp);
+        w.onsuccess = () => res();
+        w.onerror = () => rej(w.error);
+      });
+    }
+
+    async function getRecentCrashes(db, limit=10) {
+      const crashes = await new Promise((res, rej) => {
+        const store = tx(db, "crashes");
+        const idx = store.index("runId");
+        const r = idx.getAll(runId);
+        r.onsuccess = () => res(r.result || []);
+        r.onerror = () => rej(r.error);
+      });
+      crashes.sort((a,b) => b.crashAt - a.crashAt);
+      return crashes.slice(0, limit);
+    }
+
+    async function writeCrash(db, crash) {
+      // Ring buffer per RUN: keep only the last maxCrashes
+      const existing = await getRecentCrashes(db, 9999);
+      if (existing.length >= maxCrashes) {
+        existing.sort((a,b) => a.crashAt - b.crashAt);
+        const toDelete = existing.slice(0, existing.length - maxCrashes + 1);
+        await new Promise((res, rej) => {
+          const t = db.transaction("crashes", "readwrite");
+          const store = t.objectStore("crashes");
+          toDelete.forEach(x => store.delete(x.id));
+          t.oncomplete = () => res();
+          t.onerror = () => rej(t.error);
+        });
+      }
+
+      await new Promise((res, rej) => {
+        const w = tx(db, "crashes", "readwrite").put(crash);
+        w.onsuccess = () => res();
+        w.onerror = () => rej(w.error);
+      });
+    }
+
+    async function exportAll(db) {
+      const session = await new Promise((res, rej) => {
+        const r = tx(db, "sessions").get(sessionId);
+        r.onsuccess = () => res(r.result || null);
+        r.onerror = () => rej(r.error);
+      });
+
+      const runs = await new Promise((res, rej) => {
+        const r = tx(db, "runs").getAll();
+        r.onsuccess = () => res(r.result || []);
+        r.onerror = () => rej(r.error);
+      });
+
+      const checkpoints = await new Promise((res, rej) => {
+        const idx = tx(db, "checkpoints").index("runId");
+        const r = idx.getAll(runId);
+        r.onsuccess = () => res(r.result || []);
+        r.onerror = () => rej(r.error);
+      });
+
+      const crashes = await new Promise((res, rej) => {
+        const idx = tx(db, "crashes").index("runId");
+        const r = idx.getAll(runId);
+        r.onsuccess = () => res(r.result || []);
+        r.onerror = () => rej(r.error);
+      });
+
+      const payload = {
+        exportedAt: Date.now(),
+        sessionId,
+        runId,
+        session,
+        run: runs.find(r => r.runId === runId) || null,
+        checkpoints: checkpoints.sort((a,b)=>a.t-b.t),
+        crashes: crashes.sort((a,b)=>a.crashAt-b.crashAt),
+      };
+
+      downloadJSON(payload, `crash_run_${sessionId}_${runId}_${new Date().toISOString().replaceAll(":","-")}.json`);
+    }
+
+    function downloadJSON(obj, filename) {
+      const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+
+    // ---------- Crash inference pointer (localStorage) ----------
+    // We store a small active-run pointer in localStorage:
+    // - On run start: mark active
+    // - On Stop: mark inactive
+    // - On next load: if pointer says active for this runId and we have a checkpoint, treat reload as crash
+    function getActivePtr() {
+      try { return JSON.parse(localStorage.getItem("mch_activeRun") || "null"); } catch { return null; }
+    }
+    function setActivePtr(ptr) {
+      localStorage.setItem("mch_activeRun", JSON.stringify(ptr));
+    }
+    function clearActivePtr() {
+      localStorage.removeItem("mch_activeRun");
+    }
+
+    // ---------- Media generation ----------
+    function nextImageKey() {
+      // If seed provided, deterministic sequence.
+      // Otherwise, simple increment.
+      if (rng) return Math.floor(rng() * 1e9);
+      return imageCount + 1;
+    }
+
+    function addImage() {
+      imageCount++;
+
+      const div = document.createElement("div");
+      div.className = "item";
+
+      const key = nextImageKey();
+      div.innerHTML = `<span>Image ${imageCount}</span>
+        <img src="https://picsum.photos/${W}/${H}?random=${key}"
+             loading="eager" decoding="sync">`;
+
+      container.appendChild(div);
+
+      if (videoCadence > 0 && imageCount % videoCadence === 0) addVideo();
+      if (canvasCadence > 0 && imageCount % canvasCadence === 0) addCanvas();
+    }
+
+    function addVideo() {
+      videoCount++;
+      const div = document.createElement("div");
+      div.className = "item";
+      div.innerHTML = `<span>Video ${videoCount}</span>`;
+      const v = document.createElement("video");
+      v.src = "https://www.w3schools.com/html/mov_bbb.mp4";
+      v.autoplay = true; v.loop = true; v.muted = true; v.playsInline = true;
+      div.appendChild(v);
+      container.appendChild(div);
+    }
+
+    function addCanvas() {
+      canvasCount++;
+      const div = document.createElement("div");
+      div.className = "item";
+      div.innerHTML = `<span>Canvas ${canvasCount}</span>`;
+      const c = document.createElement("canvas");
+      c.width = W; c.height = H;
+      div.appendChild(c);
+      container.appendChild(div);
+
+      const ctx = c.getContext("2d", { alpha: false, desynchronized: true });
+
+      // Intentionally heavy. This WILL push CPU hard.
+      function draw() {
+        if (stopped) return;
+        const buf = ctx.createImageData(W, H);
+        const d = buf.data;
+        for (let i = 0; i < d.length; i += 4) {
+          d[i] = Math.random() * 255;
+          d[i + 1] = Math.random() * 255;
+          d[i + 2] = Math.random() * 255;
+          d[i + 3] = 255;
+        }
+        ctx.putImageData(buf, 0, 0);
+        requestAnimationFrame(draw);
+      }
+      draw();
+    }
+
+    // ---------- Auto-scroll ----------
+    function autoScroll() {
+      if (stopped) return;
+      window.scrollBy(0, scrollSpeed);
+      requestAnimationFrame(autoScroll);
+    }
+
+    // ---------- FPS monitor ----------
+    function monitorFPS() {
+      const now = performance.now();
+      const inst = 1000 / Math.max(1, (now - lastFrameT));
+      lastFrameT = now;
+      fps = inst;
+      fpsSmoothed = fpsSmoothed * 0.9 + fps * 0.1;
+      requestAnimationFrame(monitorFPS);
+    }
+
+    // ---------- Long task observer ----------
+    function initLongTasks() {
+      try {
+        const po = new PerformanceObserver((list) => {
+          const entries = list.getEntries();
+          for (const e of entries) {
+            longTasksCount += 1;
+            longTasksTotalMs += e.duration || 0;
+          }
+        });
+        po.observe({ entryTypes: ["longtask"] });
+        longTasksSupported = true;
+      } catch (e) {
+        longTasksSupported = false;
+      }
+    }
+
+    // ---------- HUD ----------
+    function pressureLabel(fpsVal) {
+      return fpsVal < 15 ? "CRITICAL" : fpsVal < 30 ? "HIGH" : fpsVal < 45 ? "ELEVATED" : "STABLE";
+    }
+
+    function memorySnapshot() {
+      // Chrome Android may expose this. iOS Safari usually does not.
+      const m = performance && performance.memory ? performance.memory : null;
+      return {
+        jsHeapUsedBytes: m?.usedJSHeapSize ?? null,
+        jsHeapTotalBytes: m?.totalJSHeapSize ?? null,
+        jsHeapLimitBytes: m?.jsHeapSizeLimit ?? null
+      };
+    }
+
+    function fmtMB(bytes) {
+      if (!bytes && bytes !== 0) return "n/a";
+      return `${Math.round(bytes / 1024 / 1024)}MB`;
+    }
+
+    async function renderHUD(db) {
+      const mem = memorySnapshot();
+      const pressure = pressureLabel(fpsSmoothed);
+
+      const activePtr = getActivePtr();
+      const lastReloadAt = activePtr?.lastReloadAt || null;
+      const lastCrashAt = activePtr?.lastCrashAt || null;
+
+      hud.innerHTML = `
+        <div class="kv mono">
+          sessionId: ${sessionId}<br>
+          runId: ${runId}<br>
+          params: batch=${batch}, interval=${addIntervalMs}ms, scrollSpeed=${scrollSpeed}, videoCadence=${videoCadence||"OFF"}, canvasCadence=${canvasCadence||"OFF"}<br>
+          seed: ${seed || "none"}<br>
+          elapsed: ${Math.round((Date.now()-runStartedAt)/1000)}s<br>
+        </div>
+        <div class="kv" style="margin-top:8px;">
+          DOM Nodes: ${container.children.length}<br>
+          Images: ${imageCount} | Videos: ${videoCount} | Canvas: ${canvasCount}<br>
+          ScrollY: ${Math.round(window.scrollY)}<br>
+          FPS: ${fpsSmoothed.toFixed(1)} | Pressure: ${pressure}<br>
+          LongTasks: ${longTasksSupported ? `${longTasksCount} (${Math.round(longTasksTotalMs)}ms)` : "n/a"}<br>
+          Heap: used ${fmtMB(mem.jsHeapUsedBytes)} / total ${fmtMB(mem.jsHeapTotalBytes)} (limit ${fmtMB(mem.jsHeapLimitBytes)})<br>
+          Last checkpoint: ${lastCheckpoint ? new Date(lastCheckpoint.t).toLocaleTimeString() + ` (img=${lastCheckpoint.imageCount})` : "none"}<br>
+          Last reload recorded: ${lastReloadAt ? new Date(lastReloadAt).toLocaleString() : "n/a"}<br>
+          Last crash recorded: ${lastCrashAt ? new Date(lastCrashAt).toLocaleString() : "n/a"}<br>
+        </div>
+        <div class="row">
+          <button id="exportBtn">Export JSON</button>
+          <button id="stopBtn" class="secondary">${stopped ? "Stopped" : "Stop Run"}</button>
+          <button id="backBtn" class="secondary">Back</button>
+        </div>
+      `;
+
+      document.getElementById("exportBtn").onclick = async () => exportAll(db);
+      document.getElementById("stopBtn").onclick = async () => {
+        stopped = true;
+        const ptr = getActivePtr();
+        if (ptr && ptr.runId === runId) {
+          ptr.active = false;
+          ptr.stoppedAt = Date.now();
+          setActivePtr(ptr);
+        }
+        await saveRun(db, false);
+      };
+      document.getElementById("backBtn").onclick = () => location.href = "index.html";
+    }
+
+    // ---------- Main ----------
+    (async function main() {
+      const db = await openDB();
+      await ensureSession(db);
+
+      // If this run page loads and localStorage pointer says this run was active,
+      // infer an unexpected reload and log a crash using the last saved checkpoint.
+      const ptr = getActivePtr();
+      const ptrMatchesThisRun = ptr && ptr.runId === runId && ptr.sessionId === sessionId;
+
+      if (ptrMatchesThisRun && ptr.active && ptr.lastCheckpoint) {
+        const crash = {
+          id: "crash_" + uid(),
+          sessionId,
+          runId,
+          crashAt: Date.now(),
+          inferred: true,
+          priorCheckpoint: ptr.lastCheckpoint,
+          priorParams: ptr.params || null,
+          reasonSignals: {
+            note: "Inferred crash: page loaded while run was marked active."
+          }
+        };
+        await writeCrash(db, crash);
+
+        ptr.lastCrashAt = crash.crashAt;
+        ptr.lastReloadAt = Date.now();
+        setActivePtr(ptr);
+      }
+
+      // Mark this run active (this is the mechanism that makes reloads detectable)
+      const newPtr = {
+        sessionId,
+        runId,
+        active: true,
+        startedAt: runStartedAt,
+        params: { batch, addIntervalMs, scrollSpeed, videoCadence, canvasCadence, maxCrashes, seed: seed || null },
+        lastCheckpoint: ptrMatchesThisRun ? (ptr.lastCheckpoint || null) : null,
+        lastReloadAt: Date.now(),
+        lastCrashAt: ptrMatchesThisRun ? (ptr.lastCrashAt || null) : null
+      };
+      setActivePtr(newPtr);
+
+      // Save run record
+      await saveRun(db, true);
+
+      // Init observers
+      initLongTasks();
+      monitorFPS();
+
+      // Start auto-scroll
+      autoScroll();
+
+      // Infinite media append
+      const addTimer = setInterval(() => {
+        if (stopped) return;
+        for (let i = 0; i < batch; i++) addImage();
+      }, addIntervalMs);
+
+      // Checkpoint every 3 seconds
+      const CHECKPOINT_MS = 3000;
+      const checkpointTimer = setInterval(async () => {
+        if (stopped) return;
+
+        const mem = memorySnapshot();
+
+        // Capture and reset long task counters between checkpoints
+        const ltCount = longTasksCount;
+        const ltMs = longTasksTotalMs;
+        longTasksCount = 0;
+        longTasksTotalMs = 0;
+
+        const cp = {
+          id: "cp_" + uid(),
+          sessionId,
+          runId,
+          t: Date.now(),
+          imageCount,
+          videoCount,
+          canvasCount,
+          domNodeCount: container.children.length,
+          scrollY: Math.round(window.scrollY),
+          fps: fpsSmoothed,
+          longTasksCount: longTasksSupported ? ltCount : null,
+          longTasksTotalMs: longTasksSupported ? ltMs : null,
+          jsHeapUsedBytes: mem.jsHeapUsedBytes,
+          jsHeapTotalBytes: mem.jsHeapTotalBytes,
+          jsHeapLimitBytes: mem.jsHeapLimitBytes
+        };
+
+        lastCheckpoint = cp;
+        await writeCheckpoint(db, cp);
+
+        // Update pointer so reload can use the last checkpoint
+        const ptr2 = getActivePtr();
+        if (ptr2 && ptr2.runId === runId) {
+          ptr2.lastCheckpoint = {
+            t: cp.t,
+            imageCount: cp.imageCount,
+            videoCount: cp.videoCount,
+            canvasCount: cp.canvasCount,
+            domNodeCount: cp.domNodeCount,
+            scrollY: cp.scrollY,
+            fps: cp.fps,
+            longTasksCount: cp.longTasksCount,
+            longTasksTotalMs: cp.longTasksTotalMs,
+            jsHeapUsedBytes: cp.jsHeapUsedBytes,
+            jsHeapTotalBytes: cp.jsHeapTotalBytes,
+            jsHeapLimitBytes: cp.jsHeapLimitBytes
+          };
+          setActivePtr(ptr2);
+        }
+
+        await saveRun(db, true);
+      }, CHECKPOINT_MS);
+
+      // HUD update every 1 second
+      setInterval(async () => {
+        await renderHUD(db);
+      }, 1000);
+
+      // If user intentionally leaves, we do NOT want to count that as a crash.
+      // So we mark active=false on visibilitychange when hidden AND stopped=true.
+      // This is imperfect, but reduces false positives.
+      document.addEventListener("visibilitychange", async () => {
+        if (document.visibilityState === "hidden" && stopped) {
+          const ptr3 = getActivePtr();
+          if (ptr3 && ptr3.runId === runId) {
+            ptr3.active = false;
+            setActivePtr(ptr3);
+          }
+          await saveRun(db, false);
+        }
+      });
+
+      // First render
+      await renderHUD(db);
+
+      // If stopped, keep timers but no-ops; if you want to fully stop, you can clearInterval:
+      // clearInterval(addTimer); clearInterval(checkpointTimer);
+    })();
+  </script>
+</body>
+</html>
